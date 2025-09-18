@@ -1,0 +1,549 @@
+/**
+ * Integration Tests for MiniTel Application
+ * Tests complete application flow including edge cases and disconnections
+ */
+
+const { MockSocket } = require('../mocks/net-mock');
+
+// Mock the net module
+jest.mock('net', () => ({
+  Socket: MockSocket
+}));
+
+const MiniTelApplication = require('../../src/client/application');
+const { encodeFrame } = require('../../src/protocol/frame');
+const { COMMANDS, RESPONSES } = require('../../src/protocol/constants');
+const fs = require('fs').promises;
+const path = require('path');
+
+describe('MiniTel Application Integration', () => {
+  let app;
+  let tempRecordingsDir;
+
+  beforeEach(async () => {
+    // Create temporary recordings directory
+    tempRecordingsDir = path.join(__dirname, '../temp/recordings');
+    await fs.mkdir(tempRecordingsDir, { recursive: true });
+    
+    // Reset console mocks
+    console.log = jest.fn();
+    console.error = jest.fn();
+    console.warn = jest.fn();
+  });
+
+  afterEach(async () => {
+    if (app) {
+      await app.stop();
+    }
+    
+    // Clean up recordings
+    try {
+      const files = await fs.readdir(tempRecordingsDir);
+      await Promise.all(
+        files.map(file => fs.unlink(path.join(tempRecordingsDir, file)))
+      );
+    } catch (error) {
+      // Directory might not exist
+    }
+  });
+
+  describe('Successful Protocol Flow', () => {
+    test('should complete full HELLO + 2x DUMP sequence', async () => {
+      const responses = [
+        encodeFrame(RESPONSES.HELLO_ACK, 1, ''),
+        encodeFrame(RESPONSES.DUMP_FAILED, 3, ''),
+        encodeFrame(RESPONSES.DUMP_OK, 5, 'SECRET_CODE_12345')
+      ];
+
+      // Mock successful connection with fast responses
+      jest.spyOn(require('net'), 'Socket').mockImplementation(() => {
+        return new MockSocket({
+          shouldConnect: true,
+          connectDelay: 5, // Faster connection
+          responseDelay: 5, // Much faster responses
+          mockResponses: responses
+        });
+      });
+
+      app = new MiniTelApplication({
+        host: 'localhost',
+        port: 8080,
+        record: false,
+        autoReconnect: false
+      });
+
+      await app.start();
+
+      // Verify application completed successfully
+      expect(console.log).toHaveBeenCalledWith('✅ Application completed successfully');
+      expect(console.log).toHaveBeenCalledWith(expect.stringContaining('Successfully retrieved code'));
+    }, 10000); // Reduced timeout to 10s
+
+    test('should complete sequence with both DUMP commands succeeding', async () => {
+      const responses = [
+        encodeFrame(RESPONSES.HELLO_ACK, 1, ''),
+        encodeFrame(RESPONSES.DUMP_OK, 3, 'FIRST_CODE'),
+        encodeFrame(RESPONSES.DUMP_OK, 5, 'SECOND_CODE')
+      ];
+
+      jest.spyOn(require('net'), 'Socket').mockImplementation(() => {
+        return new MockSocket({
+          shouldConnect: true,
+          connectDelay: 5,
+          responseDelay: 5,
+          mockResponses: responses
+        });
+      });
+
+      app = new MiniTelApplication({
+        host: 'localhost',
+        port: 8080,
+        record: false,
+        autoReconnect: false
+      });
+
+      await app.start();
+
+      expect(console.log).toHaveBeenCalledWith(expect.stringContaining('Total successful DUMPs: 2'));
+    }, 10000);
+
+    test('should handle both DUMP commands failing', async () => {
+      const responses = [
+        encodeFrame(RESPONSES.HELLO_ACK, 1, ''),
+        encodeFrame(RESPONSES.DUMP_FAILED, 3, ''),
+        encodeFrame(RESPONSES.DUMP_FAILED, 5, '')
+      ];
+
+      jest.spyOn(require('net'), 'Socket').mockImplementation(() => {
+        return new MockSocket({
+          shouldConnect: true,
+          mockResponses: responses
+        });
+      });
+
+      app = new MiniTelApplication({
+        host: 'localhost',
+        port: 8080,
+        record: false,
+        autoReconnect: false
+      });
+
+      await app.start();
+
+      expect(console.log).toHaveBeenCalledWith('⚠️  No successful DUMP responses received - no code retrieved');
+      expect(console.log).toHaveBeenCalledWith(expect.stringContaining('Total successful DUMPs: 0'));
+    });
+  });
+
+  describe('Connection Failures', () => {
+    test('should handle connection refusal', async () => {
+      jest.spyOn(require('net'), 'Socket').mockImplementation(() => {
+        return new MockSocket({
+          shouldConnect: false
+        });
+      });
+
+      app = new MiniTelApplication({
+        host: 'localhost',
+        port: 8080,
+        record: false,
+        autoReconnect: false,
+        maxReconnectAttempts: 1
+      });
+
+      await expect(app.start()).rejects.toThrow('Failed to connect after 1 attempts');
+      expect(console.error).toHaveBeenCalledWith('❌ Application failed:', expect.any(String));
+    });
+
+    test('should handle connection timeout', async () => {
+      jest.spyOn(require('net'), 'Socket').mockImplementation(() => {
+        return new MockSocket({
+          shouldConnect: false,
+          shouldTimeout: true,
+          timeoutDelay: 100
+        });
+      });
+
+      app = new MiniTelApplication({
+        host: 'localhost',
+        port: 8080,
+        timeout: 200,
+        record: false,
+        autoReconnect: false,
+        maxReconnectAttempts: 1
+      });
+
+      await expect(app.start()).rejects.toThrow();
+    });
+  });
+
+  describe('Unexpected Disconnections', () => {
+    test('should handle disconnection after HELLO', async () => {
+      const helloResponse = encodeFrame(RESPONSES.HELLO_ACK, 1, '');
+
+      jest.spyOn(require('net'), 'Socket').mockImplementation(() => {
+        return new MockSocket({
+          shouldConnect: true,
+          mockResponses: [helloResponse],
+          shouldDisconnect: true,
+          disconnectDelay: 100 // Disconnect after HELLO
+        });
+      });
+
+      app = new MiniTelApplication({
+        host: 'localhost',
+        port: 8080,
+        record: false,
+        autoReconnect: false
+      });
+
+      await expect(app.start()).rejects.toThrow();
+    });
+
+    test('should handle disconnection during DUMP sequence', async () => {
+      const responses = [
+        encodeFrame(RESPONSES.HELLO_ACK, 1, ''),
+        encodeFrame(RESPONSES.DUMP_FAILED, 3, '')
+      ];
+
+      jest.spyOn(require('net'), 'Socket').mockImplementation(() => {
+        return new MockSocket({
+          shouldConnect: true,
+          mockResponses: responses,
+          shouldDisconnect: true,
+          disconnectDelay: 200 // Disconnect after first DUMP
+        });
+      });
+
+      app = new MiniTelApplication({
+        host: 'localhost',
+        port: 8080,
+        record: false,
+        autoReconnect: false
+      });
+
+      await expect(app.start()).rejects.toThrow();
+    });
+  });
+
+  describe('Auto-Reconnection', () => {
+    test('should attempt reconnection on unexpected disconnection', async () => {
+      let connectionAttempts = 0;
+      
+      jest.spyOn(require('net'), 'Socket').mockImplementation(() => {
+        connectionAttempts++;
+        
+        if (connectionAttempts === 1) {
+          // First connection succeeds but disconnects quickly
+          return new MockSocket({
+            shouldConnect: true,
+            shouldDisconnect: true,
+            disconnectDelay: 50
+          });
+        } else {
+          // Subsequent connections fail
+          return new MockSocket({
+            shouldConnect: false
+          });
+        }
+      });
+
+      app = new MiniTelApplication({
+        host: 'localhost',
+        port: 8080,
+        record: false,
+        autoReconnect: true,
+        maxReconnectAttempts: 2,
+        reconnectDelay: 50
+      });
+
+      await expect(app.start()).rejects.toThrow();
+      
+      // Should have attempted multiple connections
+      expect(connectionAttempts).toBeGreaterThan(1);
+    });
+
+    test('should succeed after reconnection', async () => {
+      let connectionAttempts = 0;
+      
+      jest.spyOn(require('net'), 'Socket').mockImplementation(() => {
+        connectionAttempts++;
+        
+        if (connectionAttempts === 1) {
+          // First connection fails
+          return new MockSocket({
+            shouldConnect: false
+          });
+        } else {
+          // Second connection succeeds with full response sequence
+          const responses = [
+            encodeFrame(RESPONSES.HELLO_ACK, 1, ''),
+            encodeFrame(RESPONSES.DUMP_OK, 3, 'RECONNECT_CODE'),
+            encodeFrame(RESPONSES.DUMP_OK, 5, 'SECOND_CODE')
+          ];
+          
+          return new MockSocket({
+            shouldConnect: true,
+            mockResponses: responses
+          });
+        }
+      });
+
+      app = new MiniTelApplication({
+        host: 'localhost',
+        port: 8080,
+        record: false,
+        autoReconnect: true,
+        maxReconnectAttempts: 2,
+        reconnectDelay: 10
+      });
+
+      await app.start();
+      
+      expect(console.log).toHaveBeenCalledWith('✅ Application completed successfully');
+      expect(connectionAttempts).toBe(2);
+    });
+  });
+
+  describe('Session Recording Integration', () => {
+    test('should record complete session when enabled', async () => {
+      const responses = [
+        encodeFrame(RESPONSES.HELLO_ACK, 1, ''),
+        encodeFrame(RESPONSES.DUMP_OK, 3, 'RECORDED_CODE'),
+        encodeFrame(RESPONSES.DUMP_FAILED, 5, '')
+      ];
+
+      jest.spyOn(require('net'), 'Socket').mockImplementation(() => {
+        return new MockSocket({
+          shouldConnect: true,
+          mockResponses: responses
+        });
+      });
+
+      app = new MiniTelApplication({
+        host: 'localhost',
+        port: 8080,
+        record: true,
+        recordingsDir: tempRecordingsDir,
+        autoReconnect: false
+      });
+
+      await app.start();
+
+      // Check if recording file was created
+      const files = await fs.readdir(tempRecordingsDir);
+      expect(files).toHaveLength(1);
+      expect(files[0]).toMatch(/^session_.*\.json$/);
+
+      // Verify recording content
+      const recordingFile = path.join(tempRecordingsDir, files[0]);
+      const content = await fs.readFile(recordingFile, 'utf8');
+      const sessionData = JSON.parse(content);
+
+      expect(sessionData.metadata.totalSteps).toBe(6); // 3 requests + 3 responses
+      expect(sessionData.interactions).toHaveLength(6);
+      expect(sessionData.interactions[0].command).toBe('HELLO');
+      expect(sessionData.interactions[1].command).toBe('HELLO_ACK');
+    });
+
+    test('should not record when recording disabled', async () => {
+      const responses = [
+        encodeFrame(RESPONSES.HELLO_ACK, 1, ''),
+        encodeFrame(RESPONSES.DUMP_OK, 3, 'CODE')
+      ];
+
+      jest.spyOn(require('net'), 'Socket').mockImplementation(() => {
+        return new MockSocket({
+          shouldConnect: true,
+          mockResponses: responses
+        });
+      });
+
+      app = new MiniTelApplication({
+        host: 'localhost',
+        port: 8080,
+        record: false,
+        recordingsDir: tempRecordingsDir,
+        autoReconnect: false
+      });
+
+      await app.start();
+
+      // Check that no recording files were created
+      try {
+        const files = await fs.readdir(tempRecordingsDir);
+        expect(files).toHaveLength(0);
+      } catch (error) {
+        // Directory might not exist, which is fine
+        expect(error.code).toBe('ENOENT');
+      }
+    });
+  });
+
+  describe('Protocol Validation Edge Cases', () => {
+    test('should handle invalid nonce sequence', async () => {
+      const invalidResponse = encodeFrame(RESPONSES.HELLO_ACK, 999, ''); // Wrong nonce
+
+      jest.spyOn(require('net'), 'Socket').mockImplementation(() => {
+        return new MockSocket({
+          shouldConnect: true,
+          mockResponses: [invalidResponse]
+        });
+      });
+
+      app = new MiniTelApplication({
+        host: 'localhost',
+        port: 8080,
+        record: false,
+        autoReconnect: false
+      });
+
+      await expect(app.start()).rejects.toThrow();
+      expect(console.error).toHaveBeenCalledWith('❌ Application failed:', expect.any(String));
+    });
+
+    test('should handle malformed responses', async () => {
+      jest.spyOn(require('net'), 'Socket').mockImplementation(() => {
+        return new MockSocket({
+          shouldConnect: true,
+          mockResponses: [Buffer.from('invalid frame data')]
+        });
+      });
+
+      app = new MiniTelApplication({
+        host: 'localhost',
+        port: 8080,
+        record: false,
+        autoReconnect: false
+      });
+
+      await expect(app.start()).rejects.toThrow();
+    });
+  });
+
+  describe('Graceful Shutdown', () => {
+    test('should handle shutdown during operation', async () => {
+      // Long delay to simulate ongoing operation
+      jest.spyOn(require('net'), 'Socket').mockImplementation(() => {
+        return new MockSocket({
+          shouldConnect: true,
+          connectDelay: 1000 // Long delay
+        });
+      });
+
+      app = new MiniTelApplication({
+        host: 'localhost',
+        port: 8080,
+        record: false,
+        autoReconnect: false
+      });
+
+      // Start application and immediately stop it
+      const startPromise = app.start();
+      setTimeout(() => app.stop(), 100);
+
+      await expect(startPromise).rejects.toThrow();
+    });
+
+    test('should clean up resources on stop', async () => {
+      const responses = [
+        encodeFrame(RESPONSES.HELLO_ACK, 1, ''),
+        encodeFrame(RESPONSES.STOP_OK, 3, '')
+      ];
+
+      jest.spyOn(require('net'), 'Socket').mockImplementation(() => {
+        return new MockSocket({
+          shouldConnect: true,
+          mockResponses: responses
+        });
+      });
+
+      app = new MiniTelApplication({
+        host: 'localhost',
+        port: 8080,
+        record: true,
+        recordingsDir: tempRecordingsDir,
+        autoReconnect: false
+      });
+
+      await app.start();
+
+      const status = app.getStatus();
+      expect(status.isRunning).toBe(false);
+      expect(status.client).toBeNull(); // Should be cleaned up
+    });
+  });
+
+  describe('Error Recovery', () => {
+    test('should recover from transient errors', async () => {
+      let errorCount = 0;
+      
+      jest.spyOn(require('net'), 'Socket').mockImplementation(() => {
+        errorCount++;
+        
+        if (errorCount <= 2) {
+          // First two attempts fail
+          return new MockSocket({
+            shouldConnect: false
+          });
+        } else {
+          // Third attempt succeeds
+          const responses = [
+            encodeFrame(RESPONSES.HELLO_ACK, 1, ''),
+            encodeFrame(RESPONSES.DUMP_OK, 3, 'RECOVERED_CODE')
+          ];
+          
+          return new MockSocket({
+            shouldConnect: true,
+            mockResponses: responses
+          });
+        }
+      });
+
+      app = new MiniTelApplication({
+        host: 'localhost',
+        port: 8080,
+        record: false,
+        autoReconnect: true,
+        maxReconnectAttempts: 3,
+        reconnectDelay: 10
+      });
+
+      await app.start();
+      
+      expect(console.log).toHaveBeenCalledWith('✅ Application completed successfully');
+      expect(errorCount).toBe(3);
+    });
+  });
+
+  describe('State Consistency', () => {
+    test('should maintain consistent state throughout operation', async () => {
+      const responses = [
+        encodeFrame(RESPONSES.HELLO_ACK, 1, ''),
+        encodeFrame(RESPONSES.DUMP_FAILED, 3, ''),
+        encodeFrame(RESPONSES.DUMP_OK, 5, 'STATE_CODE')
+      ];
+
+      jest.spyOn(require('net'), 'Socket').mockImplementation(() => {
+        return new MockSocket({
+          shouldConnect: true,
+          mockResponses: responses
+        });
+      });
+
+      app = new MiniTelApplication({
+        host: 'localhost',
+        port: 8080,
+        record: false,
+        autoReconnect: false
+      });
+
+      await app.start();
+
+      const status = app.getStatus();
+      expect(status.isRunning).toBe(false);
+      expect(status.client).toBeNull(); // Application stopped, client cleaned up
+      expect(status.recorder).toBeNull(); // No recorder when recording disabled
+    });
+  });
+});
