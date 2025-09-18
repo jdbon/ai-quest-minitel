@@ -1,0 +1,60 @@
+{
+  "name": "minitel-client",
+  "version": "1.0.0",
+  "description": "MiniTel-Lite Protocol Client with TUI and Session Recording",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "start:record": "node src/index.js --record",
+    "start:interactive": "node src/index.js --interactive",
+    "start:interactive:record": "node src/index.js --interactive --record",
+    "interactive": "node src/index.js --interactive",
+    "replay": "node src/replay.js",
+    "dev": "node --watch src/index.js",
+    "dev:interactive": "node --watch src/index.js --interactive",
+    "setup": "node scripts/setup.js",
+    "list-recordings": "node scripts/list-recordings.js",
+    "cleanup-recordings": "node scripts/list-recordings.js cleanup",
+    "export-recording": "node scripts/list-recordings.js export",
+    "lint": "yarn lint:js && yarn lint:md",
+    "lint:js": "eslint src/",
+    "lint:md": "markdownlint *.md",
+    "lint:md:fix": "markdownlint *.md --fix",
+    "test": "node scripts/test-runner.js all",
+    "test:unit": "node scripts/test-runner.js unit",
+    "test:integration": "node scripts/test-runner.js integration",
+    "test:watch": "node scripts/test-runner.js all --watch",
+    "test:coverage": "node scripts/test-runner.js all --coverage",
+    "test:verbose": "node scripts/test-runner.js all --verbose",
+    "test:help": "node scripts/test-runner.js --help",
+    "postinstall": "node scripts/setup.js"
+  },
+  "bin": {
+    "minitel-client": "./src/index.js",
+    "minitel-replay": "./src/replay.js"
+  },
+  "dependencies": {
+    "blessed": "^0.1.81",
+    "dotenv": "^17.2.2",
+    "winston": "^3.10.0",
+    "yargs": "^17.7.2"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.3",
+    "eslint": "^8.45.0",
+    "jest": "^29.6.1",
+    "markdownlint-cli": "0.37.0"
+  },
+  "keywords": [
+    "minitel",
+    "protocol",
+    "tui",
+    "tcp",
+    "client"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

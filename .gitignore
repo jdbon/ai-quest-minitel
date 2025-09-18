@@ -23,7 +23,8 @@ logs/
 
 # Session recordings
 recordings/
-*.json
+recordings/*.json
+session_*.json
 
 # Environment variables
 .env
